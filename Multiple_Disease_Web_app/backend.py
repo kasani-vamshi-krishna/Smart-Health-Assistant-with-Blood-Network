@@ -550,10 +550,3 @@ if __name__ == '__main__':
         app.run(debug=True)
     else:
         print("FATAL: Could not start the application because one or more machine learning models failed to load.")
-
-
-         # new line a
-
-         # fixed this backend.py ready for prod. 
-
-         # this is the third fix 
