@@ -136,10 +136,11 @@ const ParameterDetailChart = ({ item }) => {
     );
 };
 
-const PredictionResult = ({ result, title, inputs, onReset, diseaseType }) => {
-    const [plan, setPlan] = useState(null);
+const PredictionResult = ({ result, title, inputs, onReset, diseaseType, historyId, existingPlan }) => {
+    const [plan, setPlan] = useState(existingPlan || null);
     const [isPlanLoading, setIsPlanLoading] = useState(false);
     const { diagnosis, risk_score, risk_category, prediction, normal_ranges } = result;
+    const effectiveHistoryId = historyId || result.history_id;
     
     const riskColor = risk_category === 'Low Risk' ? '#22c55e' : risk_category === 'Moderate Risk' ? '#f59e0b' : '#ef4444';
     const chartData = [{ name: 'Risk Score', score: risk_score }];
@@ -177,6 +178,9 @@ const PredictionResult = ({ result, title, inputs, onReset, diseaseType }) => {
                 prediction
             });
             setPlan(response.data.plan);
+            if (effectiveHistoryId) {
+                axios.put(`http://127.0.0.1:5000/history/${effectiveHistoryId}/plan`, { plan: response.data.plan }).catch(() => {});
+            }
         } catch (error) {
             console.error("Error generating plan:", error);
             setPlan("Failed to generate a personalized plan. Please try again.");

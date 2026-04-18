@@ -8,6 +8,9 @@ import Diabetes from './pages/Diabetes';
 import Heart from './pages/Heart';
 import Parkinsons from './pages/Parkinsons';
 import BloodNetwork from './pages/BloodNetwork';
+import Profile from './pages/Profile';
+import History from './pages/History';
+import HistoryDetail from './pages/HistoryDetail';
 
 const ProtectedRoute = ({ children }) => {
     const { user, loading } = useAuth();
@@ -25,16 +28,21 @@ const ProtectedRoute = ({ children }) => {
 };
 
 const AppLayout = () => {
+    const { user } = useAuth();
+    const isHospital = user?.role === 'hospital';
     return (
         <div className="flex h-screen bg-gray-50 font-sans">
             <Sidebar />
             <main className="flex-1 flex overflow-hidden">
                 <Routes>
                     <Route path="/dashboard" element={<Dashboard />} />
-                    <Route path="/diabetes" element={<Diabetes />} />
-                    <Route path="/heart" element={<Heart />} />
-                    <Route path="/parkinsons" element={<Parkinsons />} />
+                    {!isHospital && <Route path="/diabetes" element={<Diabetes />} />}
+                    {!isHospital && <Route path="/heart" element={<Heart />} />}
+                    {!isHospital && <Route path="/parkinsons" element={<Parkinsons />} />}
+                    {!isHospital && <Route path="/history" element={<History />} />}
+                    {!isHospital && <Route path="/history/:id" element={<HistoryDetail />} />}
                     <Route path="/blood-network" element={<BloodNetwork />} />
+                    <Route path="/profile" element={<Profile />} />
                     <Route path="*" element={<Navigate to="/dashboard" />} />
                 </Routes>
             </main>

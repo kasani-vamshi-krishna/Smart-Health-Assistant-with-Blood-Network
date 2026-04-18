@@ -2,7 +2,7 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 import axios from 'axios';
 
 const AuthContext = createContext(null);
-const API_URL = 'http://127.0.0.1:5000';
+export const API_URL = 'http://127.0.0.1:5000';
 
 export const AuthProvider = ({ children }) => {
     const [user, setUser] = useState(null);
@@ -56,8 +56,30 @@ export const AuthProvider = ({ children }) => {
         setUser(prev => ({ ...prev, ...updates }));
     };
 
+    const toggleDonate = async (willing, details = {}) => {
+        const payload = { willing_to_donate: willing, ...details };
+        const res = await axios.put(`${API_URL}/auth/toggle-donate`, payload);
+        setUser(res.data.user);
+        return res.data.user;
+    };
+
+    const updateProfile = async (payload) => {
+        const res = await axios.put(`${API_URL}/auth/update-profile`, payload);
+        setUser(res.data.user);
+        return res.data.user;
+    };
+
+    const updateLocation = async (payload) => {
+        const res = await axios.put(`${API_URL}/auth/update-location`, payload);
+        setUser(res.data.user);
+        return res.data.user;
+    };
+
     return (
-        <AuthContext.Provider value={{ user, token, loading, login, register, logout, updateUser }}>
+        <AuthContext.Provider value={{
+            user, token, loading, login, register, logout,
+            updateUser, toggleDonate, updateProfile, updateLocation
+        }}>
             {children}
         </AuthContext.Provider>
     );
