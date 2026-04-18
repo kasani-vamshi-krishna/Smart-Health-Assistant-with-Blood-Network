@@ -3,6 +3,11 @@ import pickle
 import sqlite3
 import secrets
 import math
+import json
+import smtplib
+import random
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import numpy as np
 import google.generativeai as genai
 from flask import Flask, request, jsonify, send_file, g
@@ -17,6 +22,42 @@ import jwt
 app = Flask(__name__)
 CORS(app)
 app.config['SECRET_KEY'] = secrets.token_hex(32)
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB uploads
+
+# --- SMTP Config for OTP email ---
+SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', 587))
+SMTP_USER = os.environ.get('SMTP_USER', 'kasanivamshikrishna2024@gmail.com')
+SMTP_PASS = os.environ.get('SMTP_PASS', 'jjxfufbhajpgeqvj')  # 16-char Gmail App Password (no spaces)
+OTP_TTL_MINUTES = 10
+
+
+def send_otp_email(to_email, otp, purpose='registration'):
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = 'Your Health AI verification code'
+    msg['From'] = f'Health AI <{SMTP_USER}>'
+    msg['To'] = to_email
+
+    text_body = f"Your Health AI {purpose} code is: {otp}\n\nIt expires in {OTP_TTL_MINUTES} minutes."
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;padding:24px;background:#f8fafc;border-radius:12px">
+      <h2 style="color:#4f46e5;margin:0 0 8px">Health AI verification</h2>
+      <p style="color:#334155">Use this code to complete your {purpose}:</p>
+      <div style="font-size:32px;letter-spacing:8px;font-weight:800;color:#111827;background:#fff;border:2px dashed #6366f1;padding:16px;text-align:center;border-radius:8px">{otp}</div>
+      <p style="color:#64748b;font-size:13px;margin-top:16px">This code expires in {OTP_TTL_MINUTES} minutes. If you didn't request it, ignore this email.</p>
+    </div>
+    """
+    msg.attach(MIMEText(text_body, 'plain'))
+    msg.attach(MIMEText(html_body, 'html'))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, [to_email], msg.as_string())
+
+
+def generate_otp():
+    return f"{random.randint(100000, 999999)}"
 
 DATABASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'health_assistant.db')
 
@@ -44,6 +85,11 @@ def close_db(exception):
         db.close()
 
 
+def column_exists(db, table, column):
+    rows = db.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r[1] == column for r in rows)
+
+
 def init_db():
     db = sqlite3.connect(DATABASE)
     db.execute('''CREATE TABLE IF NOT EXISTS users (
@@ -62,6 +108,72 @@ def init_db():
         willing_to_donate INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
+
+    # Backwards-compatible column additions for existing DBs
+    new_columns = [
+        ('role', "TEXT DEFAULT 'user'"),             # 'user' or 'hospital'
+        ('hospital_name', 'TEXT'),
+        ('license_number', 'TEXT'),
+        ('verified', 'INTEGER DEFAULT 0'),
+        ('profile_picture', 'TEXT'),                 # base64 data URL
+        ('donor_quantity_ml', 'INTEGER DEFAULT 0'),
+        ('donor_health_conditions', 'TEXT'),         # JSON
+        ('donor_last_updated', 'TIMESTAMP'),
+    ]
+    for col, ddl in new_columns:
+        if not column_exists(db, 'users', col):
+            db.execute(f'ALTER TABLE users ADD COLUMN {col} {ddl}')
+
+    db.execute('''CREATE TABLE IF NOT EXISTS prediction_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        disease_type TEXT NOT NULL,
+        inputs TEXT NOT NULL,
+        prediction INTEGER NOT NULL,
+        diagnosis TEXT NOT NULL,
+        risk_score INTEGER NOT NULL,
+        risk_category TEXT NOT NULL,
+        plan TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )''')
+
+    db.execute('''CREATE TABLE IF NOT EXISTS donation_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        donor_id INTEGER NOT NULL,
+        hospital_id INTEGER NOT NULL,
+        quantity_ml INTEGER,
+        health_conditions TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(donor_id) REFERENCES users(id),
+        FOREIGN KEY(hospital_id) REFERENCES users(id)
+    )''')
+
+    db.execute('''CREATE TABLE IF NOT EXISTS pending_otps (
+        email TEXT PRIMARY KEY,
+        otp TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        attempts INTEGER DEFAULT 0
+    )''')
+
+    # Seed a list of accepted hospital license numbers for simple verification.
+    db.execute('''CREATE TABLE IF NOT EXISTS verified_hospitals (
+        license_number TEXT PRIMARY KEY,
+        hospital_name TEXT
+    )''')
+    seed = [
+        ('APOLLO-HYD-001', 'Apollo Hospitals Hyderabad'),
+        ('KIMS-HYD-002',   'KIMS Hospitals Hyderabad'),
+        ('AIIMS-DEL-003',  'AIIMS Delhi'),
+        ('FORTIS-BLR-004', 'Fortis Hospital Bangalore'),
+        ('YASHODA-HYD-005','Yashoda Hospital Hyderabad'),
+        ('MED-DEMO-0000',  'Demo Verified Hospital'),
+    ]
+    for lic, name in seed:
+        db.execute('INSERT OR IGNORE INTO verified_hospitals (license_number, hospital_name) VALUES (?, ?)', (lic, name))
+
     db.commit()
     db.close()
 
@@ -101,47 +213,150 @@ def get_current_user():
     return user
 
 
+def user_to_dict(user):
+    return {
+        'id': user['id'],
+        'full_name': user['full_name'],
+        'email': user['email'],
+        'blood_type': user['blood_type'],
+        'phone': user['phone'],
+        'age': user['age'],
+        'gender': user['gender'],
+        'city': user['city'],
+        'state': user['state'],
+        'latitude': user['latitude'],
+        'longitude': user['longitude'],
+        'willing_to_donate': user['willing_to_donate'],
+        'role': user['role'] if user['role'] else 'user',
+        'hospital_name': user['hospital_name'],
+        'license_number': user['license_number'],
+        'verified': user['verified'] or 0,
+        'profile_picture': user['profile_picture'],
+        'donor_quantity_ml': user['donor_quantity_ml'] or 0,
+        'donor_health_conditions': json.loads(user['donor_health_conditions']) if user['donor_health_conditions'] else None,
+    }
+
+
 # --- Auth Endpoints ---
+@app.route('/auth/send-otp', methods=['POST'])
+def send_otp():
+    data = request.get_json() or {}
+    email = (data.get('email') or '').strip().lower()
+    purpose = data.get('purpose', 'registration')
+    if not email or '@' not in email:
+        return jsonify({'error': 'A valid email is required'}), 400
+
+    db = get_db()
+    if purpose == 'registration':
+        existing = db.execute('SELECT id FROM users WHERE email = ?', (email,)).fetchone()
+        if existing:
+            return jsonify({'error': 'An account with this email already exists'}), 409
+
+    otp = generate_otp()
+    expires = datetime.datetime.utcnow() + datetime.timedelta(minutes=OTP_TTL_MINUTES)
+    db.execute(
+        '''INSERT INTO pending_otps (email, otp, purpose, expires_at, attempts)
+           VALUES (?, ?, ?, ?, 0)
+           ON CONFLICT(email) DO UPDATE SET otp=excluded.otp, purpose=excluded.purpose,
+                                            expires_at=excluded.expires_at, attempts=0''',
+        (email, otp, purpose, expires.isoformat())
+    )
+    db.commit()
+
+    try:
+        send_otp_email(email, otp, purpose)
+    except Exception as e:
+        print(f"SMTP error: {e}")
+        return jsonify({'error': 'Failed to send verification email. Please try again later.'}), 500
+
+    return jsonify({'message': 'Verification code sent to your email', 'expires_in_minutes': OTP_TTL_MINUTES})
+
+
+def verify_otp_or_error(email, otp):
+    if not email or not otp:
+        return 'Email and OTP are required'
+    db = get_db()
+    row = db.execute('SELECT * FROM pending_otps WHERE email = ?', (email,)).fetchone()
+    if not row:
+        return 'No verification code found. Please request a new one.'
+    if row['attempts'] >= 5:
+        return 'Too many attempts. Please request a new code.'
+    try:
+        expires_at = datetime.datetime.fromisoformat(row['expires_at'])
+    except Exception:
+        expires_at = datetime.datetime.utcnow() - datetime.timedelta(minutes=1)
+    if datetime.datetime.utcnow() > expires_at:
+        return 'Verification code has expired. Please request a new one.'
+    if str(row['otp']) != str(otp).strip():
+        db.execute('UPDATE pending_otps SET attempts = attempts + 1 WHERE email = ?', (email,))
+        db.commit()
+        return 'Invalid verification code'
+    # success — consume it
+    db.execute('DELETE FROM pending_otps WHERE email = ?', (email,))
+    db.commit()
+    return None
+
+
 @app.route('/auth/register', methods=['POST'])
 def register():
     data = request.get_json()
-    required = ['full_name', 'email', 'password', 'phone', 'blood_type', 'age', 'gender', 'city', 'state']
+    role = (data.get('role') or 'user').lower()
+    required = ['full_name', 'email', 'password', 'phone', 'blood_type', 'age', 'gender', 'city', 'state', 'otp']
+    if role == 'hospital':
+        required += ['hospital_name', 'license_number']
+
     for field in required:
-        if not data.get(field):
+        if data.get(field) in (None, ''):
             return jsonify({'error': f'{field} is required'}), 400
 
+    email = data['email'].strip().lower()
+    otp_error = verify_otp_or_error(email, data.get('otp'))
+    if otp_error:
+        return jsonify({'error': otp_error}), 400
+
     db = get_db()
-    existing = db.execute('SELECT id FROM users WHERE email = ?', (data['email'],)).fetchone()
+    existing = db.execute('SELECT id FROM users WHERE email = ?', (email,)).fetchone()
     if existing:
         return jsonify({'error': 'An account with this email already exists'}), 409
 
+    verified = 0
+    if role == 'hospital':
+        row = db.execute(
+            'SELECT license_number FROM verified_hospitals WHERE license_number = ?',
+            (data['license_number'],)
+        ).fetchone()
+        if not row:
+            return jsonify({'error': 'Hospital license number is not in the verified registry. Please contact support.'}), 400
+        verified = 1
+
     password_hash = generate_password_hash(data['password'])
+    willing = 1 if data.get('willing_to_donate') else 0
+    donor_qty = int(data.get('donor_quantity_ml') or 0) if willing else 0
+    donor_conds = json.dumps(data.get('donor_health_conditions') or {}) if willing else None
+
     try:
         cursor = db.execute(
-            '''INSERT INTO users (full_name, email, password_hash, phone, blood_type, age, gender, city, state, latitude, longitude, willing_to_donate)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (data['full_name'], data['email'], password_hash, data['phone'],
+            '''INSERT INTO users (full_name, email, password_hash, phone, blood_type, age, gender, city, state,
+                                  latitude, longitude, willing_to_donate, role, hospital_name, license_number, verified,
+                                  donor_quantity_ml, donor_health_conditions)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (data['full_name'], email, password_hash, data['phone'],
              data['blood_type'], int(data['age']), data['gender'],
              data['city'], data['state'],
              float(data.get('latitude', 0)), float(data.get('longitude', 0)),
-             1 if data.get('willing_to_donate') else 0)
+             willing,
+             role,
+             data.get('hospital_name'),
+             data.get('license_number'),
+             verified,
+             donor_qty,
+             donor_conds)
         )
         db.commit()
         user_id = cursor.lastrowid
         token = create_token(user_id)
-        return jsonify({
-            'token': token,
-            'user': {
-                'id': user_id,
-                'full_name': data['full_name'],
-                'email': data['email'],
-                'blood_type': data['blood_type'],
-                'phone': data['phone'],
-                'city': data['city'],
-                'state': data['state'],
-                'willing_to_donate': 1 if data.get('willing_to_donate') else 0
-            }
-        }), 201
+        user = db.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
+        return jsonify({'token': token, 'user': user_to_dict(user)}), 201
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -149,7 +364,7 @@ def register():
 @app.route('/auth/login', methods=['POST'])
 def login():
     data = request.get_json()
-    email = data.get('email', '')
+    email = (data.get('email') or '').strip().lower()
     password = data.get('password', '')
 
     if not email or not password:
@@ -162,19 +377,7 @@ def login():
         return jsonify({'error': 'Invalid email or password'}), 401
 
     token = create_token(user['id'])
-    return jsonify({
-        'token': token,
-        'user': {
-            'id': user['id'],
-            'full_name': user['full_name'],
-            'email': user['email'],
-            'blood_type': user['blood_type'],
-            'phone': user['phone'],
-            'city': user['city'],
-            'state': user['state'],
-            'willing_to_donate': user['willing_to_donate']
-        }
-    })
+    return jsonify({'token': token, 'user': user_to_dict(user)})
 
 
 @app.route('/auth/me', methods=['GET'])
@@ -182,22 +385,7 @@ def get_me():
     user = get_current_user()
     if not user:
         return jsonify({'error': 'Unauthorized'}), 401
-    return jsonify({
-        'user': {
-            'id': user['id'],
-            'full_name': user['full_name'],
-            'email': user['email'],
-            'blood_type': user['blood_type'],
-            'phone': user['phone'],
-            'city': user['city'],
-            'state': user['state'],
-            'age': user['age'],
-            'gender': user['gender'],
-            'willing_to_donate': user['willing_to_donate'],
-            'latitude': user['latitude'],
-            'longitude': user['longitude']
-        }
-    })
+    return jsonify({'user': user_to_dict(user)})
 
 
 @app.route('/auth/update-location', methods=['PUT'])
@@ -207,10 +395,14 @@ def update_location():
         return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json()
     db = get_db()
-    db.execute('UPDATE users SET latitude = ?, longitude = ? WHERE id = ?',
-               (float(data.get('latitude', 0)), float(data.get('longitude', 0)), user['id']))
+    db.execute(
+        'UPDATE users SET latitude = ?, longitude = ?, city = COALESCE(?, city), state = COALESCE(?, state) WHERE id = ?',
+        (float(data.get('latitude', 0)), float(data.get('longitude', 0)),
+         data.get('city'), data.get('state'), user['id'])
+    )
     db.commit()
-    return jsonify({'message': 'Location updated'})
+    updated = db.execute('SELECT * FROM users WHERE id = ?', (user['id'],)).fetchone()
+    return jsonify({'message': 'Location updated', 'user': user_to_dict(updated)})
 
 
 @app.route('/auth/toggle-donate', methods=['PUT'])
@@ -219,11 +411,47 @@ def toggle_donate():
     if not user:
         return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json()
+    willing = 1 if data.get('willing_to_donate') else 0
     db = get_db()
-    db.execute('UPDATE users SET willing_to_donate = ? WHERE id = ?',
-               (1 if data.get('willing_to_donate') else 0, user['id']))
+
+    if willing == 1:
+        quantity = int(data.get('donor_quantity_ml') or 0)
+        conditions = data.get('donor_health_conditions') or {}
+        db.execute(
+            '''UPDATE users SET willing_to_donate = ?, donor_quantity_ml = ?,
+                                donor_health_conditions = ?, donor_last_updated = CURRENT_TIMESTAMP
+               WHERE id = ?''',
+            (willing, quantity, json.dumps(conditions), user['id'])
+        )
+    else:
+        db.execute('UPDATE users SET willing_to_donate = 0 WHERE id = ?', (user['id'],))
+
     db.commit()
-    return jsonify({'message': 'Donation preference updated'})
+    updated = db.execute('SELECT * FROM users WHERE id = ?', (user['id'],)).fetchone()
+    return jsonify({'message': 'Donation preference updated', 'user': user_to_dict(updated)})
+
+
+@app.route('/auth/update-profile', methods=['PUT'])
+def update_profile():
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json()
+    db = get_db()
+    db.execute(
+        '''UPDATE users
+           SET full_name = COALESCE(?, full_name),
+               phone = COALESCE(?, phone),
+               city = COALESCE(?, city),
+               state = COALESCE(?, state),
+               profile_picture = COALESCE(?, profile_picture)
+           WHERE id = ?''',
+        (data.get('full_name'), data.get('phone'), data.get('city'),
+         data.get('state'), data.get('profile_picture'), user['id'])
+    )
+    db.commit()
+    updated = db.execute('SELECT * FROM users WHERE id = ?', (user['id'],)).fetchone()
+    return jsonify({'message': 'Profile updated', 'user': user_to_dict(updated)})
 
 
 # --- Blood Network ---
@@ -240,7 +468,7 @@ BLOOD_COMPATIBILITY = {
 
 
 def haversine(lat1, lon1, lat2, lon2):
-    R = 6371  # Earth's radius in km
+    R = 6371
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
@@ -248,11 +476,20 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * c
 
 
+def _require_verified_hospital(user):
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    if (user['role'] or 'user') != 'hospital' or not user['verified']:
+        return jsonify({'error': 'Only verified hospital accounts can access the Blood Network. This protects donor privacy.'}), 403
+    return None
+
+
 @app.route('/blood-network/search', methods=['POST'])
 def search_donors():
     user = get_current_user()
-    if not user:
-        return jsonify({'error': 'Unauthorized'}), 401
+    guard = _require_verified_hospital(user)
+    if guard:
+        return guard
 
     data = request.get_json()
     needed_blood_type = data.get('blood_type', user['blood_type'])
@@ -267,9 +504,11 @@ def search_donors():
     db = get_db()
     placeholders = ','.join('?' * len(compatible_types))
     donors = db.execute(
-        f'''SELECT id, full_name, phone, blood_type, city, state, latitude, longitude
+        f'''SELECT id, full_name, phone, blood_type, city, state, latitude, longitude,
+                   donor_quantity_ml, donor_health_conditions
             FROM users
             WHERE willing_to_donate = 1
+            AND role = 'user'
             AND blood_type IN ({placeholders})
             AND id != ?
             AND latitude != 0 AND longitude != 0''',
@@ -287,7 +526,9 @@ def search_donors():
                 'blood_type': donor['blood_type'],
                 'city': donor['city'],
                 'state': donor['state'],
-                'distance_km': round(distance, 1)
+                'distance_km': round(distance, 1),
+                'donor_quantity_ml': donor['donor_quantity_ml'] or 0,
+                'donor_health_conditions': json.loads(donor['donor_health_conditions']) if donor['donor_health_conditions'] else {}
             })
 
     results.sort(key=lambda x: x['distance_km'])
@@ -303,14 +544,16 @@ def search_donors():
 @app.route('/blood-network/stats', methods=['GET'])
 def blood_network_stats():
     db = get_db()
-    total_donors = db.execute('SELECT COUNT(*) FROM users WHERE willing_to_donate = 1').fetchone()[0]
-    total_users = db.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+    total_donors = db.execute("SELECT COUNT(*) FROM users WHERE willing_to_donate = 1 AND role = 'user'").fetchone()[0]
+    total_users = db.execute("SELECT COUNT(*) FROM users WHERE role = 'user'").fetchone()[0]
+    total_hospitals = db.execute("SELECT COUNT(*) FROM users WHERE role = 'hospital' AND verified = 1").fetchone()[0]
     blood_type_counts = db.execute(
-        'SELECT blood_type, COUNT(*) as count FROM users WHERE willing_to_donate = 1 GROUP BY blood_type'
+        "SELECT blood_type, COUNT(*) as count FROM users WHERE willing_to_donate = 1 AND role = 'user' GROUP BY blood_type"
     ).fetchall()
     return jsonify({
         'total_donors': total_donors,
         'total_users': total_users,
+        'total_hospitals': total_hospitals,
         'blood_type_distribution': {row['blood_type']: row['count'] for row in blood_type_counts}
     })
 
@@ -318,7 +561,8 @@ def blood_network_stats():
 # --- Load Machine Learning Models ---
 def load_model(path):
     try:
-        with open(path, 'rb') as file:
+        abs_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+        with open(abs_path, 'rb') as file:
             return pickle.load(file)
     except Exception as e:
         print(f"Error loading model {path}: {e}")
@@ -329,7 +573,7 @@ diabetes_model = load_model('models/trained_model_diab.sav')
 heart_disease_model = load_model('models/trained_model_heart.sav')
 parkinsons_model = load_model('models/trained_model_par.sav')
 
-# --- Normal Value Ranges for Comparison Charts ---
+# --- Normal Value Ranges ---
 normal_ranges = {
     'diabetes': {
         'Pregnancies': {'min': 0, 'max': 6, 'avg': 3},
@@ -383,7 +627,7 @@ normal_ranges = {
 }
 
 
-# --- PDF Generation Class ---
+# --- PDF Generation ---
 class ReportPDF(FPDF):
     def header(self):
         self.set_font('Helvetica', 'B', 20)
@@ -458,7 +702,6 @@ class ReportPDF(FPDF):
         self.ln(5)
 
 
-# --- Helper Functions ---
 def get_risk_category(score):
     if score < 40:
         return 'Low Risk'
@@ -482,18 +725,94 @@ def predict_disease(disease_name):
 
     config = models[disease_name]
     data = request.get_json()
-    features = [float(data[key]) for key in data.keys()]
+    try:
+        features = [float(data[key]) for key in data.keys()]
+    except (KeyError, TypeError, ValueError) as e:
+        return jsonify({'error': f'Invalid input: {e}'}), 400
 
     prediction = config['model'].predict([features])[0]
-    score = np.random.randint(65, 98) if prediction == 1 else np.random.randint(5, 35)
+    score = int(np.random.randint(65, 98) if prediction == 1 else np.random.randint(5, 35))
+    risk_category = get_risk_category(score)
+    diagnosis = config['diag_pos'] if prediction == 1 else config['diag_neg']
+
+    history_id = None
+    user = get_current_user()
+    if user:
+        db = get_db()
+        cursor = db.execute(
+            '''INSERT INTO prediction_history (user_id, disease_type, inputs, prediction, diagnosis, risk_score, risk_category)
+               VALUES (?, ?, ?, ?, ?, ?, ?)''',
+            (user['id'], disease_name, json.dumps(data), int(prediction), diagnosis, score, risk_category)
+        )
+        db.commit()
+        history_id = cursor.lastrowid
 
     return jsonify({
         'prediction': int(prediction),
-        'diagnosis': config['diag_pos'] if prediction == 1 else config['diag_neg'],
+        'diagnosis': diagnosis,
         'risk_score': score,
-        'risk_category': get_risk_category(score),
-        'normal_ranges': normal_ranges.get(disease_name, {})
+        'risk_category': risk_category,
+        'normal_ranges': normal_ranges.get(disease_name, {}),
+        'history_id': history_id
     })
+
+
+@app.route('/history', methods=['GET'])
+def list_history():
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    db = get_db()
+    rows = db.execute(
+        '''SELECT id, disease_type, prediction, diagnosis, risk_score, risk_category, created_at
+           FROM prediction_history WHERE user_id = ? ORDER BY created_at DESC''',
+        (user['id'],)
+    ).fetchall()
+    return jsonify({'history': [dict(r) for r in rows]})
+
+
+@app.route('/history/<int:history_id>', methods=['GET'])
+def get_history_item(history_id):
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    db = get_db()
+    row = db.execute(
+        'SELECT * FROM prediction_history WHERE id = ? AND user_id = ?',
+        (history_id, user['id'])
+    ).fetchone()
+    if not row:
+        return jsonify({'error': 'Not found'}), 404
+    item = dict(row)
+    item['inputs'] = json.loads(item['inputs']) if item['inputs'] else {}
+    item['normal_ranges'] = normal_ranges.get(item['disease_type'], {})
+    return jsonify({'item': item})
+
+
+@app.route('/history/<int:history_id>', methods=['DELETE'])
+def delete_history_item(history_id):
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    db = get_db()
+    db.execute('DELETE FROM prediction_history WHERE id = ? AND user_id = ?', (history_id, user['id']))
+    db.commit()
+    return jsonify({'message': 'Deleted'})
+
+
+@app.route('/history/<int:history_id>/plan', methods=['PUT'])
+def save_history_plan(history_id):
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized'}), 401
+    data = request.get_json() or {}
+    db = get_db()
+    db.execute(
+        'UPDATE prediction_history SET plan = ? WHERE id = ? AND user_id = ?',
+        (data.get('plan'), history_id, user['id'])
+    )
+    db.commit()
+    return jsonify({'message': 'Plan saved'})
 
 
 @app.route('/generate-plan', methods=['POST'])
